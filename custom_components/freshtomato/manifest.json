@@ -5,7 +5,7 @@
   "config_flow": true,
   "documentation": "https://github.com/mx5gr/ha-freshtomato",
   "issue_tracker": "https://github.com/mx5gr/ha-freshtomato/issues",
-  "requirements": [],
+  "requirements": ["asyncssh>=2.14.0"],
   "dependencies": [],
   "codeowners": ["@mx5gr"],
   "iot_class": "local_polling",

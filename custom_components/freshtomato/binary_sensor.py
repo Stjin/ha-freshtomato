@@ -1,10 +1,14 @@
 """Binary sensor platform for FreshTomato integration.
 
 Binary sensors:
-  • WAN Connected            – True when WAN IP is present
-  • 2.4 GHz SSID Broadcast   – True when SSID is visible (not hidden)
-  • 5 GHz SSID Broadcast     – True when SSID is visible
-  • Wireless Client Mode     – True when router has no WAN / acts as AP or repeater
+  • WAN Connected              – True when WAN IP is present (per WAN in multi-WAN)
+  • 2.4 GHz SSID Broadcast     – True when SSID is visible (not hidden)
+  • 5 GHz SSID Broadcast       – True when SSID is visible
+  • Wireless Client Mode       – True when router has no WAN / acts as AP or repeater
+  • Per-port Link               – True when an Ethernet port has an active link
+
+WiFi interface state (active/inactive) is exposed as switches in the switch platform,
+where they can also be toggled in AP mode.
 """
 from __future__ import annotations
 
@@ -31,14 +35,8 @@ class FreshTomatoBinarySensorDescription(BinarySensorEntityDescription):
     value_fn: Any = None
 
 
-BINARY_SENSORS: tuple[FreshTomatoBinarySensorDescription, ...] = (
-    FreshTomatoBinarySensorDescription(
-        key="wan_connected",
-        name="WAN Connected",
-        device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        icon="mdi:wan",
-        value_fn=lambda d: bool(d.wan_ip and d.wan_ip not in ("0.0.0.0", "")),
-    ),
+# Non-WAN binary sensors that are always created (single + multi-WAN)
+_STATIC_BINARY_SENSORS: tuple[FreshTomatoBinarySensorDescription, ...] = (
     FreshTomatoBinarySensorDescription(
         key="wl0_broadcast",
         name="2.4 GHz SSID Broadcast",
@@ -63,7 +61,47 @@ BINARY_SENSORS: tuple[FreshTomatoBinarySensorDescription, ...] = (
             and len(d.dhcp_leases) == 0
         ),
     ),
+    FreshTomatoBinarySensorDescription(
+        key="band_steering",
+        name="Wireless Band Steering",
+        device_class=None,
+        icon="mdi:wifi-sync",
+        # FreshTomato BSD daemon key is "bsd_enabled"; older builds may use
+        # "wl_bsd_enabled" — check both and treat "1" as enabled.
+        value_fn=lambda d: (
+            d.nvram.get("bsd_enabled", d.nvram.get("wl_bsd_enabled", "0")) == "1"
+        ),
+    ),
 )
+
+
+def _make_wan_connected_desc(
+    wan_idx: int,
+    multi_wan: bool,
+) -> FreshTomatoBinarySensorDescription:
+    """Create a WAN Connected binary sensor description for a given WAN index.
+
+    When multi_wan is False the legacy key/name is used to preserve existing
+    entity IDs ("wan_connected" / "WAN Connected").
+    """
+    key   = f"wan{wan_idx}_connected" if multi_wan else "wan_connected"
+    name  = f"WAN{wan_idx} Connected"  if multi_wan else "WAN Connected"
+    _idx  = wan_idx
+
+    def _value_fn(data: "RouterData") -> bool:
+        for w in data.wan_connections:
+            if w.index == _idx:
+                return bool(w.ip and w.ip not in ("0.0.0.0", ""))
+        # Fallback for single-WAN when wan_connections is empty
+        return bool(data.wan_ip and data.wan_ip not in ("0.0.0.0", ""))
+
+    return FreshTomatoBinarySensorDescription(
+        key=key,
+        name=name,
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        icon="mdi:wan",
+        value_fn=_value_fn,
+    )
 
 
 async def async_setup_entry(
@@ -73,10 +111,41 @@ async def async_setup_entry(
 ) -> None:
     coordinator: FreshTomatoCoordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
 
-    # Static sensors
-    entities: list = [
+    nvram = coordinator.data.nvram if coordinator.data else {}
+    wan_connections = coordinator.data.wan_connections if coordinator.data else []
+    try:
+        _mwan_num = int(nvram.get("mwan_num", "1"))
+    except ValueError:
+        _mwan_num = 1
+    multi_wan = _mwan_num > 1 or len(wan_connections) > 1
+
+    # Bridge mode: wan_proto disabled but lan1 has a real IP (WET uplink)
+    _bridge_mode   = (
+        nvram.get("wan_proto", "") in ("disabled", "")
+        and bool(nvram.get("lan1_ipaddr", ""))
+        and nvram.get("lan1_ipaddr", "") not in ("", "0.0.0.0")
+    )
+    _bridge_ifname = nvram.get("lan1_ifname", "br1") or "br1"
+
+    # WAN Connected sensors — one per active WAN
+    if multi_wan:
+        active_indices = [w.index for w in wan_connections] if wan_connections else [1]
+        wan_entities = [
+            FreshTomatoBinarySensor(coordinator, entry, _make_wan_connected_desc(idx, True))
+            for idx in active_indices
+        ]
+    elif _bridge_mode:
+        # In bridge mode the wan_ipaddr reflects the WET uplink address, not a
+        # real WAN port.  "WAN Connected" would always show True even with the
+        # WAN ethernet port unplugged, so suppress it entirely.
+        wan_entities = []
+    else:
+        wan_entities = [FreshTomatoBinarySensor(coordinator, entry, _make_wan_connected_desc(1, False))]
+
+    # All other static sensors
+    entities: list = wan_entities + [
         FreshTomatoBinarySensor(coordinator, entry, desc)
-        for desc in BINARY_SENSORS
+        for desc in _STATIC_BINARY_SENSORS
     ]
 
     # Dynamic per-port link sensors — created from etherstates data.
@@ -227,3 +296,4 @@ def _decode_port_state(state: str) -> tuple[int | None, str | None]:
         return int(speed_str), duplex
     except ValueError:
         return None, duplex
+

@@ -32,11 +32,11 @@ SIGNAL_NEW_DEVICE = f"{DOMAIN}_new_device"
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: FreshTomatoCoordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
-    track_wired: bool = entry.options.get(CONF_TRACK_WIRED, DEFAULT_TRACK_WIRED)
+    coordinator: FreshTomatoCoordinator = hass.data[DOMAIN][config_entry.entry_id][DATA_COORDINATOR]
+    track_wired: bool = config_entry.options.get(CONF_TRACK_WIRED, DEFAULT_TRACK_WIRED)
 
     # Keep track of already-created entities so we don't duplicate
     known_macs: set[str] = set()
@@ -55,18 +55,21 @@ async def async_setup_entry(
             if mac not in known_macs:
                 known_macs.add(mac)
                 new_entities.append(
-                    FreshTomatoDeviceTracker(coordinator, entry, mac, is_wireless=True)
+                    FreshTomatoDeviceTracker(coordinator, config_entry, mac, is_wireless=True)
                 )
 
         # Wired / DHCP devices
         if track_wired:
             wireless_macs = {c["mac"] for c in coordinator.data.wireless_clients}
-            for lease in coordinator.data.dhcp_leases:
-                mac = lease["mac"]
+            # Primary: DHCP lease table. Fallback: ARP table (bridge/WET mode,
+            # where DHCP is served upstream and dhcp_leases is always empty).
+            wired_source = coordinator.data.dhcp_leases or coordinator.data.arp_table
+            for device in wired_source:
+                mac = device["mac"]
                 if mac not in known_macs and mac not in wireless_macs:
                     known_macs.add(mac)
                     new_entities.append(
-                        FreshTomatoDeviceTracker(coordinator, entry, mac, is_wireless=False)
+                        FreshTomatoDeviceTracker(coordinator, config_entry, mac, is_wireless=False)
                     )
 
         if new_entities:
@@ -74,7 +77,7 @@ async def async_setup_entry(
 
     # Run once immediately and then on every coordinator update
     _check_for_new_devices()
-    entry.async_on_unload(
+    config_entry.async_on_unload(
         coordinator.async_add_listener(_check_for_new_devices)
     )
 
@@ -106,8 +109,11 @@ class FreshTomatoDeviceTracker(
             return False
         if self._is_wireless:
             return any(c["mac"] == self._mac for c in self.coordinator.data.wireless_clients)
-        # Wired: check DHCP leases
-        return any(l["mac"] == self._mac for l in self.coordinator.data.dhcp_leases)
+        # Wired: DHCP leases preferred, ARP table fallback (bridge mode)
+        return (
+            any(l["mac"] == self._mac for l in self.coordinator.data.dhcp_leases)
+            or any(a["mac"] == self._mac for a in self.coordinator.data.arp_table)
+        )
 
     @property
     def mac_address(self) -> str:
@@ -115,13 +121,17 @@ class FreshTomatoDeviceTracker(
 
     @property
     def hostname(self) -> str | None:
-        """Return device hostname from DHCP lease if available."""
+        """Return device hostname from DHCP lease or ARP table if available."""
         if self.coordinator.data is None:
             return None
         for lease in self.coordinator.data.dhcp_leases:
             if lease["mac"] == self._mac:
                 name = lease.get("name", "")
                 return name if name and name != "*" else None
+        for arp in self.coordinator.data.arp_table:
+            if arp["mac"] == self._mac:
+                name = arp.get("name", "")
+                return name if name else None
         return None
 
     @property
@@ -165,6 +175,12 @@ class FreshTomatoDeviceTracker(
                 if lease["mac"] == self._mac:
                     attrs["lease_remaining_sec"] = lease.get("lease")
                     break
+            else:
+                # Bridge mode — no lease, enrich from ARP table
+                for arp in self.coordinator.data.arp_table:
+                    if arp["mac"] == self._mac:
+                        attrs["interface"] = arp.get("iface")
+                        break
         return attrs
 
     @property

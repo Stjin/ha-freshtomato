@@ -27,6 +27,24 @@ _HEX_INT_RE = re.compile(r'0x([0-9a-fA-F]+)')
 
 
 @dataclass
+class WanConnection:
+    """Holds per-WAN-interface data for multi-WAN configurations.
+
+    index == 1  → primary WAN (nvram keys without number: wan_ipaddr, wan_proto…)
+    index >= 2  → additional WANs using wanN_* keys (e.g. wan2_ipaddr, wan3_proto…)
+    """
+    index:    int = 1
+    ip:       str = ""
+    netmask:  str = ""
+    gateway:  str = ""
+    proto:    str = ""
+    ifname:   str = ""
+    dns:      str = ""
+    uptime:   int = 0
+    lease:    int = 0
+
+
+@dataclass
 class RouterData:
     wireless_clients: list[dict[str, Any]] = field(default_factory=list)
     dhcp_leases:      list[dict[str, Any]] = field(default_factory=list)
@@ -34,12 +52,18 @@ class RouterData:
     netdev:           dict[str, dict[str, int]] = field(default_factory=dict)
     wl_noise:         list[int] = field(default_factory=list)
     nvram:            dict[str, str] = field(default_factory=dict)
+    # wlstats[N].radio — live hardware RF state per radio unit (from status-data.jsx).
+    # True = RF on, False = RF off.  Missing entry means unknown.
+    wl_hw_radio:      dict[int, bool] = field(default_factory=dict)
+    # Legacy single-WAN fields – always reflect WAN1 for backward compat
     wan_ip:           str = ""
     wan_netmask:      str = ""
     wan_gateway:      str = ""
     wan_uptime:       int = 0
     wan_lease:        int = 0
     eth_ports:        dict[str, str] = field(default_factory=dict)
+    # Multi-WAN: one WanConnection per active WAN; list index 0 == WAN1
+    wan_connections:  list[WanConnection] = field(default_factory=list)
 
 
 class FreshTomatoAPI:
@@ -74,10 +98,16 @@ class FreshTomatoAPI:
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer":      f"{self._base_url}/status-overview.asp",
         }
+        _LOGGER.debug("POST %s  body=%r", url, body)
         try:
             async with self._session.post(url, data=body, headers=headers) as resp:
                 resp.raise_for_status()
-                return await resp.text()
+                text = await resp.text()
+                _LOGGER.debug(
+                    "POST %s  status=%d  response=\n%s",
+                    url, resp.status, text,
+                )
+                return text
         except aiohttp.ClientResponseError as err:
             if err.status in (401, 403):
                 raise InvalidAuth(f"Auth failed: {err}") from err
@@ -183,16 +213,31 @@ class FreshTomatoAPI:
             return {k: str(v) for k, v in nvram.items()}
         return {}
 
-    async def fetch_nvram_from_asp(self, variables: list[str]) -> dict[str, str]:
-        """Scrape nvram from status-data.jsx."""
+    async def fetch_nvram_from_asp(
+        self, variables: list[str]
+    ) -> tuple[dict[str, str], dict[int, bool]]:
+        """Scrape nvram and wlstats from status-data.jsx.
+
+        Returns
+        -------
+        (nvram_dict, wl_hw_radio)
+            nvram_dict   – filtered nvram key/value strings
+            wl_hw_radio  – {unit_index: hw_radio_on} from wlstats[N].radio
+                           radio field: 1 = RF on, 0 = RF off
+        """
         url     = f"{self._base_url}/status-data.jsx"
         headers = {"Referer": f"{self._base_url}/status-overview.asp"}
+        _LOGGER.debug("GET %s  params=_http_id=***", url)
         try:
             async with self._session.get(
                 url, params={"_http_id": self._http_id}, headers=headers
             ) as resp:
                 resp.raise_for_status()
                 text = await resp.text()
+                _LOGGER.debug(
+                    "GET %s  status=%d  response=\n%s",
+                    url, resp.status, text,
+                )
         except aiohttp.ClientResponseError as err:
             if err.status in (401, 403):
                 raise InvalidAuth from err
@@ -200,7 +245,8 @@ class FreshTomatoAPI:
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise CannotConnect from err
 
-        result = {}
+        # Parse nvram object
+        nvram_result: dict[str, str] = {}
         mo = _NVRAM_OBJ_RE.search(text)
         if mo:
             raw = (mo.group(1)
@@ -210,13 +256,34 @@ class FreshTomatoAPI:
             try:
                 data = ast.literal_eval(raw)
                 if isinstance(data, dict):
-                    result = {k: str(v) for k, v in data.items() if k in variables}
+                    nvram_result = {k: str(v) for k, v in data.items() if k in variables}
             except (ValueError, SyntaxError):
                 pass
         for key, val in _NVRAM_PUSH_RE.findall(text):
             if key in variables:
-                result[key] = val
-        return result
+                nvram_result[key] = val
+
+        # Parse wlstats array — present in status-data.jsx as:
+        #   wlstats = [ { radio: 1, client: 1, channel: 13, ... }, ... ]
+        #
+        # FreshTomato JS treats this as a standard boolean:
+        #   if (wlstats[uidx].radio) { /* show stats — radio is ON */ }
+        # So: radio = 1 → RF hardware ON, radio = 0 → RF hardware OFF.
+        # This is the same convention as the wlN_radio nvram key.
+        wl_hw_radio: dict[int, bool] = {}
+        parsed_all = self._parse_js_vars(text)
+        wlstats_raw = parsed_all.get("wlstats")
+        if isinstance(wlstats_raw, list):
+            for idx, entry in enumerate(wlstats_raw):
+                if isinstance(entry, dict) and "radio" in entry:
+                    try:
+                        # radio == 1 → hardware ON (True), radio == 0 → OFF (False)
+                        wl_hw_radio[idx] = bool(int(entry["radio"]))
+                    except (ValueError, TypeError):
+                        pass
+            _LOGGER.debug("wlstats hw_radio parsed (1=on, 0=off): %r", wl_hw_radio)
+
+        return nvram_result, wl_hw_radio
 
     async def fetch_firmware_version(self) -> str | None:
         """Try exec=nvram for firmware build strings."""
@@ -263,6 +330,7 @@ class FreshTomatoAPI:
         try:
             url = f"{self._base_url}/about.asp"
             headers = {"Referer": f"{self._base_url}/status-overview.asp"}
+            _LOGGER.debug("GET %s  params=_http_id=***", url)
             async with self._session.get(
                 url,
                 params={"_http_id": self._http_id},
@@ -272,6 +340,10 @@ class FreshTomatoAPI:
                     _LOGGER.debug("fetch_about_page: HTTP %d", resp.status)
                     return None
                 text = await resp.text()
+                _LOGGER.debug(
+                    "GET %s  status=%d  response=\n%s",
+                    url, resp.status, text,
+                )
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.debug("fetch_about_page: error=%s", err)
             return None
@@ -292,19 +364,6 @@ class FreshTomatoAPI:
         _LOGGER.debug("fetch_about_page: no version found in about.asp")
         return None
 
-    async def toggle_wifi_radio(self, unit: int, enable: bool) -> None:
-        url  = f"{self._base_url}/wlradio.cgi"
-        body = (f"_http_id={self._http_id}&enable={'1' if enable else '0'}"
-                f"&_wl_unit={unit}&_nextpage=status-overview.asp&_nextwait=5")
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer":      f"{self._base_url}/status-overview.asp",
-        }
-        try:
-            async with self._session.post(url, data=body, headers=headers) as resp:
-                resp.raise_for_status()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise CannotConnect from err
 
 
 class CannotConnect(Exception):

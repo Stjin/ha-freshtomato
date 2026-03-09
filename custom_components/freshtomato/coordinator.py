@@ -31,13 +31,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import CannotConnect, FreshTomatoAPI, InvalidAuth, RouterData
+from .api import CannotConnect, FreshTomatoAPI, InvalidAuth, RouterData, WanConnection
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MWAN_MAX,
     NVRAM_REFRESH_INTERVAL,
     NVRAM_VARS,
 )
+from .ssh import check_ssh_available
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +61,29 @@ class FreshTomatoCoordinator(DataUpdateCoordinator[RouterData]):
         self._nvram_supported: bool | None = None
         # Detected router operating mode
         self.wireless_client_mode: bool = False
+        # Keys written optimistically by switches/buttons → remaining guard cycles.
+        # A key is skipped during nvram merges while its counter is > 0.
+        # The counter is decremented once per full update cycle and removed when
+        # it reaches 0.  Using 2 cycles gives the router time to persist the
+        # change before we trust the polled value again.
+        self._pending_nvram_writes: dict[str, int] = {}
+        # SSH availability — checked once on first coordinator cycle.
+        # None  = not yet checked
+        # True  = SSH reachable (connection handshake succeeded)
+        # False = SSH unreachable or authentication failed for all candidates
+        self.ssh_available: bool | None = None
+        # The SSH username that succeeded during the availability check.
+        # Always a string (defaults to "root") so callers don't need to guard.
+        self.ssh_username: str = "root"
+        # Live hardware RF radio state per unit, from wlstats in status-data.jsx.
+        # Updated every nvram refresh cycle (cycle 1 + every NVRAM_REFRESH_INTERVAL).
+        # {unit_index: True=on, False=off}
+        self._wl_hw_radio: dict[int, bool] = {}
+        # Per-unit cooldown: monotonic timestamp after which the next Interface
+        # toggle is allowed.  Set by the Interface switch after each successful
+        # SSH command.  Radio switch does not use cooldown.
+        # {unit_index: float (monotonic time)}
+        self.iface_cooldown_until: dict[int, float] = {}
 
         super().__init__(
             hass,
@@ -76,12 +101,27 @@ class FreshTomatoCoordinator(DataUpdateCoordinator[RouterData]):
             _parse_devlist(devlist_raw, data)
 
             # The devlist response embeds a full nvram dict every cycle.
-            # Merge it into the cache immediately — this is the most reliable
-            # source for wl0_mode, wan_ipaddr, wan_ifname, etc. and it arrives
-            # on every poll without a separate HTTP call.
+            # Merge it into the cache — but skip any keys that were written
+            # optimistically (e.g. wl0_radio after a switch toggle) so a stale
+            # router response cannot immediately undo the write.
             inline_nvram = devlist_raw.get("nvram", {})
             if isinstance(inline_nvram, dict):
-                self._nvram_cache.update({k: str(v) for k, v in inline_nvram.items() if v != ""})
+                self._nvram_cache.update({
+                    k: str(v)
+                    for k, v in inline_nvram.items()
+                    if v != "" and k not in self._pending_nvram_writes
+                })
+            if self._pending_nvram_writes:
+                _LOGGER.debug(
+                    "Skipped inline nvram overwrite for pending keys: %s",
+                    list(self._pending_nvram_writes),
+                )
+
+            # Check SSH availability once on first cycle (cached for lifetime
+            # of this coordinator instance).  Runs after devlist so we already
+            # have host/port credentials available from entry.data.
+            if self.ssh_available is None:
+                await self._check_ssh()
 
             # Debug: log etherstates parse result so we can diagnose port issues
             _LOGGER.debug(
@@ -102,17 +142,43 @@ class FreshTomatoCoordinator(DataUpdateCoordinator[RouterData]):
             if self._cycle_count == 1 or (self._cycle_count % NVRAM_REFRESH_INTERVAL == 0):
                 await self._refresh_nvram()
 
+            # Decrement the per-key guard counters; remove expired ones.
+            # Guards are set to _PENDING_GUARD_CYCLES by switch entities and
+            # count down to 0 over successive cycles so the optimistic cache
+            # value is protected until the router has had time to persist it.
+            expired = [k for k, n in self._pending_nvram_writes.items() if n <= 1]
+            for k in expired:
+                del self._pending_nvram_writes[k]
+            for k in self._pending_nvram_writes:
+                self._pending_nvram_writes[k] -= 1
+
         except InvalidAuth as err:
             raise UpdateFailed(f"Authentication failed: {err}") from err
         except CannotConnect as err:
             raise UpdateFailed(f"Cannot connect to router: {err}") from err
 
         data.nvram = dict(self._nvram_cache)
+        # Populate live hardware radio state from the last wlstats refresh.
+        data.wl_hw_radio = dict(self._wl_hw_radio)
 
-        # WAN scalars — populated from inline nvram merged into cache above
-        data.wan_ip      = data.nvram.get("wan_ipaddr", "").strip()
-        data.wan_netmask = data.nvram.get("wan_netmask", "").strip()
-        data.wan_gateway = (data.nvram.get("wan_gateway_get") or data.nvram.get("wan_gateway", "")).strip()
+        # ── Build wan_connections list (supports 1–MWAN_MAX WANs) ──────────
+        # WAN1 uses the legacy unprefixed keys (wan_ipaddr, wan_proto, …).
+        # WAN2–WAN4 use wanN_* keys (wan2_ipaddr, wan2_proto, …).
+        # A WAN slot is included only when its proto is not "disabled" / empty.
+        data.wan_connections = _build_wan_connections(data.nvram)
+
+        # Legacy single-WAN scalars — always reflect WAN1 for backward compat
+        if data.wan_connections:
+            w1 = data.wan_connections[0]
+            data.wan_ip      = w1.ip
+            data.wan_netmask = w1.netmask
+            data.wan_gateway = w1.gateway
+        else:
+            data.wan_ip      = data.nvram.get("wan_ipaddr", "").strip()
+            data.wan_netmask = data.nvram.get("wan_netmask", "").strip()
+            data.wan_gateway = (
+                data.nvram.get("wan_gateway_get") or data.nvram.get("wan_gateway", "")
+            ).strip()
 
         # Detect wireless client / repeater / bridge mode
         wan_proto = data.nvram.get("wan_proto", "")
@@ -123,22 +189,51 @@ class FreshTomatoCoordinator(DataUpdateCoordinator[RouterData]):
 
         return data
 
+    def _safe_nvram_update(self, result: dict[str, str]) -> None:
+        """Merge result into the nvram cache, skipping any pending-write keys."""
+        filtered = {k: v for k, v in result.items() if k not in self._pending_nvram_writes}
+        skipped = set(result.keys()) - set(filtered.keys())
+        if skipped:
+            _LOGGER.debug("_refresh_nvram: skipped pending keys: %s", skipped)
+        self._nvram_cache.update(filtered)
+
+    async def _check_ssh(self) -> None:
+        """Check SSH availability and cache the result in self.ssh_available.
+
+        Tries 'root' first (FreshTomato default SSH user), then the configured
+        HTTP username as fallback.  Stores the working username in
+        self.ssh_username for use by all subsequent SSH commands.
+
+        The SSH port defaults to 22; override via entry.data['ssh_port'].
+        """
+        host     = self._entry.data["host"]
+        port     = int(self._entry.data.get("ssh_port", 22))
+        username = self._entry.data.get("username", "admin")
+        password = self._entry.data.get("password", "")
+        self.ssh_available, self.ssh_username = await check_ssh_available(
+            host, port, username, password
+        )
+
     async def _refresh_nvram(self) -> None:
         if self._nvram_supported is not False:
             try:
                 result = await self.api.fetch_nvram(NVRAM_VARS)
                 if result:
-                    self._nvram_cache.update(result)
+                    self._safe_nvram_update(result)
                     self._nvram_supported = True
-                    return
-                self._nvram_supported = False
+                    # exec=nvram doesn't provide wlstats — fall through to ASP
+                    # for wlstats even when nvram is available.
             except Exception:  # pylint: disable=broad-except
                 self._nvram_supported = False
 
         try:
-            result = await self.api.fetch_nvram_from_asp(NVRAM_VARS)
-            if result:
-                self._nvram_cache.update(result)
+            nvram_result, wl_hw_radio = await self.api.fetch_nvram_from_asp(NVRAM_VARS)
+            if nvram_result:
+                self._safe_nvram_update(nvram_result)
+                if self._nvram_supported is None:
+                    self._nvram_supported = False  # exec=nvram not used
+            if wl_hw_radio:
+                self._wl_hw_radio.update(wl_hw_radio)
         except CannotConnect as err:
             _LOGGER.warning("NVRAM ASP fallback failed: %s", err)
 
@@ -303,6 +398,59 @@ def _parse_netdev(raw: dict[str, Any], data: RouterData) -> None:
             "txp": _safe_int(counters.get("txp", 0)),
         }
 
+
+
+def _build_wan_connections(nvram: dict[str, str]) -> list[WanConnection]:
+    """Build a list of WanConnection objects from the nvram cache.
+
+    FreshTomato naming convention:
+      WAN1  → wan_ipaddr / wan_proto / wan_gateway / wan_netmask / wan_ifname …
+      WAN2  → wan2_ipaddr / wan2_proto / … (note: NO underscore between "wan" and the digit)
+      WAN3  → wan3_ipaddr / …
+      WAN4  → wan4_ipaddr / …
+
+    A WAN slot is included in the result only when its proto is not empty or
+    "disabled".  This mirrors what the FreshTomato GUI shows as "active" WANs.
+    """
+    connections: list[WanConnection] = []
+    for idx in range(1, MWAN_MAX + 1):
+        if idx == 1:
+            prefix = "wan"   # legacy: wan_ipaddr, wan_proto, etc.
+        else:
+            prefix = f"wan{idx}"  # wan2_ipaddr, wan3_proto, etc.
+
+        proto = nvram.get(f"{prefix}_proto", "").strip()
+        if proto in ("", "disabled"):
+            # If this is WAN1 and proto is missing/disabled we still include
+            # it so legacy sensors don't vanish; for WAN2+ we skip silently.
+            if idx > 1:
+                continue
+
+        ip      = nvram.get(f"{prefix}_ipaddr", "").strip()
+        netmask = nvram.get(f"{prefix}_netmask", "").strip()
+        gateway = (
+            nvram.get(f"{prefix}_gateway_get") or nvram.get(f"{prefix}_gateway", "")
+        ).strip()
+        ifname  = (
+            nvram.get(f"{prefix}_ifname") or nvram.get(f"{prefix}_ifnames", "")
+        ).strip().split()[0] if (
+            nvram.get(f"{prefix}_ifname") or nvram.get(f"{prefix}_ifnames", "")
+        ).strip() else ""
+        dns     = (
+            nvram.get(f"{prefix}_get_dns") or nvram.get(f"{prefix}_dns", "")
+        ).strip()
+
+        connections.append(WanConnection(
+            index   = idx,
+            ip      = ip,
+            netmask = netmask,
+            gateway = gateway,
+            proto   = proto,
+            ifname  = ifname,
+            dns     = dns,
+        ))
+
+    return connections
 
 
 def _looks_like_mac(s: str) -> bool:

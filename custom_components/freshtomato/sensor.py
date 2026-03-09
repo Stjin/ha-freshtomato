@@ -3,18 +3,22 @@
 Sensors provided (all from a single coordinator data snapshot):
 ──────────────────────────────────────────────────────────────────
 Router / System
-  • WAN IP Address
-  • WAN Gateway
-  • WAN Connection Type (proto)
-  • WAN DHCP Lease Remaining (seconds → human)
-  • WAN Uptime (seconds since WAN connected)
+  • WAN IP Address          (per WAN – dynamically created)
+  • WAN Gateway             (per WAN)
+  • WAN Connection Type     (per WAN)
+  • WAN DHCP Lease Remaining(per WAN)
+  • WAN Uptime              (per WAN, disabled by default)
   • LAN IP Address
   • Firmware Version
   • Router Model
 
 Network bandwidth (per WAN interface)
   • WAN Download (bytes total – from netdev)
-  • WAN Upload (bytes total – from netdev)
+  • WAN Upload   (bytes total – from netdev)
+
+Multi-WAN: when mwan_num > 1 the above WAN sensors are created once per
+active WAN (e.g. "WAN1 IP Address", "WAN2 IP Address", …).  Single-WAN
+routers continue to show "WAN IP Address" as before.
 
 Wi-Fi (per radio band – 2.4 GHz and 5 GHz)
   • SSID
@@ -53,6 +57,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DATA_COORDINATOR, DOMAIN
 from .coordinator import FreshTomatoCoordinator, RouterData
+from .api import WanConnection
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,54 +71,100 @@ class FreshTomatoSensorDescription(SensorEntityDescription):
 
 
 def _wired_count(data: RouterData) -> int:
-    """Wired devices = DHCP leases whose MACs are not in the wireless list."""
+    """Wired devices = connected devices whose MACs are not wireless clients.
+
+    Primary source: DHCP lease table (when this router runs a DHCP server).
+    Fallback source: ARP table (when DHCP is handled upstream, e.g. in
+    WET/bridge mode).  The ARP table always contains all recently-seen LAN
+    hosts regardless of who issued their leases.
+    """
     wireless_macs = {c["mac"] for c in data.wireless_clients}
-    wired = [l for l in data.dhcp_leases if l["mac"] not in wireless_macs]
+    if data.dhcp_leases:
+        wired = [l for l in data.dhcp_leases if l["mac"] not in wireless_macs]
+    else:
+        # No DHCP leases — router is likely in bridge/WET mode and not serving
+        # DHCP itself.  Use the ARP table instead.
+        wired = [e for e in data.arp_table if e["mac"] not in wireless_macs]
     return len(wired)
 
 
-WAN_SENSORS: tuple[FreshTomatoSensorDescription, ...] = (
-    FreshTomatoSensorDescription(
-        key="wan_ip",
-        name="WAN IP Address",
-        icon="mdi:ip-network",
-        value_fn=lambda d: d.wan_ip or None,
-    ),
-    FreshTomatoSensorDescription(
-        key="wan_gateway",
-        name="WAN Gateway",
-        icon="mdi:router-network",
-        value_fn=lambda d: d.wan_gateway or None,
-    ),
-    FreshTomatoSensorDescription(
-        key="wan_proto",
-        name="WAN Connection Type",
-        icon="mdi:ethernet",
-        value_fn=lambda d: d.nvram.get("wan_proto") or None,
-    ),
-    FreshTomatoSensorDescription(
-        key="wan_uptime",
-        name="WAN Uptime",
-        icon="mdi:timer-outline",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        entity_registry_enabled_default=False,
-        value_fn=lambda d: d.wan_uptime if d.wan_uptime else None,
-    ),
-    FreshTomatoSensorDescription(
-        key="wan_lease",
-        name="WAN DHCP Lease Remaining",
-        icon="mdi:clock-outline",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        entity_registry_enabled_default=False,
-        value_fn=lambda d: d.wan_lease if d.wan_lease else None,
-    ),
-)
+def _make_wan_sensor_descs(
+    wan_idx: int,
+    multi_wan: bool,
+) -> tuple["FreshTomatoSensorDescription", ...]:
+    """Return sensor descriptions for a single WAN interface.
+
+    When multi_wan is False the legacy single-WAN key/name format is used
+    (key="wan_ip", name="WAN IP Address") so existing entity IDs are preserved.
+    When multi_wan is True labels are prefixed with "WAN<N>" so each WAN gets
+    its own unique entity (key="wan1_ip", name="WAN1 IP Address", etc.).
+    """
+    prefix     = f"wan{wan_idx}_" if multi_wan else "wan_"
+    label      = f"WAN{wan_idx} " if multi_wan else "WAN "
+    # Capture wan_idx for use in closures
+    _idx = wan_idx
+
+    def _get_wan(data: RouterData) -> "WanConnection | None":
+        for w in data.wan_connections:
+            if w.index == _idx:
+                return w
+        return None
+
+    return (
+        FreshTomatoSensorDescription(
+            key=f"{prefix}ip",
+            name=f"{label}IP Address",
+            icon="mdi:ip-network",
+            value_fn=lambda d, _g=_get_wan: (_g(d).ip or None) if _g(d) else None,
+        ),
+        FreshTomatoSensorDescription(
+            key=f"{prefix}gateway",
+            name=f"{label}Gateway",
+            icon="mdi:router-network",
+            value_fn=lambda d, _g=_get_wan: (_g(d).gateway or None) if _g(d) else None,
+        ),
+        FreshTomatoSensorDescription(
+            key=f"{prefix}proto",
+            name=f"{label}Connection Type",
+            icon="mdi:ethernet",
+            value_fn=lambda d, _g=_get_wan: (_g(d).proto or None) if _g(d) else None,
+        ),
+        FreshTomatoSensorDescription(
+            key=f"{prefix}dns",
+            name="Router DNS",
+            icon="mdi:dns",
+            entity_registry_enabled_default=False,
+            value_fn=lambda d, _g=_get_wan: (_g(d).dns or None) if _g(d) else None,
+        ),
+        FreshTomatoSensorDescription(
+            key=f"{prefix}uptime",
+            name=f"{label}Uptime",
+            icon="mdi:timer-outline",
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            device_class=SensorDeviceClass.DURATION,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_registry_enabled_default=False,
+            value_fn=lambda d, _g=_get_wan: (_g(d).uptime or None) if _g(d) else None,
+        ),
+        FreshTomatoSensorDescription(
+            key=f"{prefix}lease",
+            name=f"{label}DHCP Lease Remaining",
+            icon="mdi:clock-outline",
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            device_class=SensorDeviceClass.DURATION,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_registry_enabled_default=False,
+            value_fn=lambda d, _g=_get_wan: (_g(d).lease or None) if _g(d) else None,
+        ),
+    )
 
 SYSTEM_SENSORS: tuple[FreshTomatoSensorDescription, ...] = (
+    FreshTomatoSensorDescription(
+        key="default_gateway",
+        name="Router Default Gateway",
+        icon="mdi:router-network",
+        value_fn=lambda d: d.nvram.get("lan_gateway") or None,
+    ),
     FreshTomatoSensorDescription(
         key="lan_ip",
         name="LAN IP Address",
@@ -145,8 +196,7 @@ SYSTEM_SENSORS: tuple[FreshTomatoSensorDescription, ...] = (
         name="Total Connected Devices",
         icon="mdi:devices",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda d: len({c["mac"] for c in d.wireless_clients}
-                                | {l["mac"] for l in d.dhcp_leases}),
+        value_fn=lambda d: len(d.wireless_clients) + _wired_count(d),
     ),
     FreshTomatoSensorDescription(
         key="wireless_clients",
@@ -236,17 +286,85 @@ async def async_setup_entry(
 ) -> None:
     coordinator: FreshTomatoCoordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
     entities: list[FreshTomatoSensor] = []
-
-    # ── Static WAN + System sensors ───────────────────────────────────────
-    # Bridge IP sensors (lan_ip, lan1_ip) are given dynamic names using the
-    # actual bridge interface name from nvram (e.g. "br0 IP", "br1 IP").
     nvram = coordinator.data.nvram if coordinator.data else {}
+
+    # ── Bridge mode detection ─────────────────────────────────────────────
+    # When wan_proto is "disabled" but lan1_ipaddr is a real IP, the router is
+    # operating as a Wireless Ethernet Bridge (WET).  The "WAN" IP/gateway
+    # actually belong to the bridge interface (br1), not a true WAN port.
+    # We rename WAN-labelled entities to "Bridge <ifname> …" in this case.
+    # The entity *keys* are kept unchanged to preserve existing entity IDs.
+    _wan_proto_main = nvram.get("wan_proto", "")
+    _lan1_ip        = nvram.get("lan1_ipaddr", "")
+    _bridge_mode    = (
+        _wan_proto_main in ("disabled", "")
+        and bool(_lan1_ip) and _lan1_ip not in ("", "0.0.0.0")
+    )
+    # bridge_ifname is the LAN bridge carrying the WET uplink (e.g. "br1")
+    _bridge_ifname  = nvram.get("lan1_ifname", "br1") or "br1"
+    # bridge_iface is the physical/VLAN interface for bandwidth measurement
+    # lan1_ifnames example: "vlan3 eth1" → use the first token
+    _bridge_bw_iface = (nvram.get("lan1_ifnames", "") or "").split()[0] or _bridge_ifname
+
+    # ── WAN sensors (per-WAN for multi-WAN; legacy single for single-WAN) ──
+    # mwan_num tells us how many WAN ports are configured; default is 1.
+    wan_connections = coordinator.data.wan_connections if coordinator.data else []
+    # Determine whether the router is actually running in multi-WAN mode:
+    # mwan_num > 1 in NVRAM  OR  more than one active WAN connection detected.
+    try:
+        _mwan_num = int(nvram.get("mwan_num", "1"))
+    except ValueError:
+        _mwan_num = 1
+    multi_wan = _mwan_num > 1 or len(wan_connections) > 1
+
+    # Name-override map: sensor key → display name, applied in bridge mode
+    _bridge_name_overrides: dict[str, str] = {
+        "wan_ip":      f"{_bridge_ifname} Interface IP Address",
+        "wan_gateway": f"{_bridge_ifname} Gateway",
+        "wan_dns":     "Router DNS",
+    } if _bridge_mode else {}
+
+    # Keys to suppress entirely in bridge mode (value is always "disabled" or misleading)
+    _bridge_skip_keys: frozenset[str] = frozenset({"wan_proto"}) if _bridge_mode else frozenset()
+
+    if multi_wan:
+        # One set of WAN sensors per active WAN connection
+        active_indices = [w.index for w in wan_connections] if wan_connections else [1]
+        for wan_idx in active_indices:
+            wan_proto = (
+                next((w.proto for w in wan_connections if w.index == wan_idx), "")
+            )
+            for desc in _make_wan_sensor_descs(wan_idx, multi_wan=True):
+                if desc.key.endswith(("_uptime", "_lease")) and wan_proto in ("disabled", ""):
+                    continue
+                entities.append(FreshTomatoSensor(coordinator, entry, desc))
+    else:
+        # Single-WAN: use legacy key names to preserve existing entity IDs
+        wan_proto = nvram.get("wan_proto", "")
+        for desc in _make_wan_sensor_descs(1, multi_wan=False):
+            if desc.key in ("wan_uptime", "wan_lease") and wan_proto in ("disabled", ""):
+                continue
+            # In bridge mode suppress sensors that are always wrong/meaningless
+            if desc.key in _bridge_skip_keys:
+                continue
+            # Apply bridge-mode name overrides
+            override_name = _bridge_name_overrides.get(desc.key)
+            if override_name:
+                desc = FreshTomatoSensorDescription(
+                    key=desc.key,
+                    name=override_name,
+                    icon=desc.icon,
+                    entity_registry_enabled_default=desc.entity_registry_enabled_default,
+                    native_unit_of_measurement=desc.native_unit_of_measurement,
+                    device_class=desc.device_class,
+                    state_class=desc.state_class,
+                    value_fn=desc.value_fn,
+                )
+            entities.append(FreshTomatoSensor(coordinator, entry, desc))
+
+    # ── System sensors ────────────────────────────────────────────────────
     wan_proto = nvram.get("wan_proto", "")
-    for desc in WAN_SENSORS + SYSTEM_SENSORS:
-        # Skip WAN uptime and lease when WAN is disabled (bridge/AP mode) —
-        # these values are never populated and would show "unknown" permanently.
-        if desc.key in ("wan_uptime", "wan_lease") and wan_proto in ("disabled", ""):
-            continue
+    for desc in SYSTEM_SENSORS:
         if desc.key == "lan_ip":
             ifname = nvram.get("lan_ifname", "br0") or "br0"
             desc = FreshTomatoSensorDescription(
@@ -267,6 +385,7 @@ async def async_setup_entry(
             )
         entities.append(FreshTomatoSensor(coordinator, entry, desc))
 
+
     # ── Per-band Wi-Fi sensors ────────────────────────────────────────────
     for band_label, band_idx in [("2.4 GHz", 0), ("5 GHz", 1)]:
         for tmpl in _WIFI_SENSOR_TEMPLATES:
@@ -284,19 +403,45 @@ async def async_setup_entry(
             ))
 
     # ── WAN bandwidth sensors ─────────────────────────────────────────────
-    for tmpl in _BW_SENSOR_TEMPLATES:
-        key_suffix = "rx" if "rx" in tmpl.key else "tx"
-        entities.append(FreshTomatoSensor(coordinator, entry,
-            FreshTomatoSensorDescription(
-                key=f"wan_{tmpl.key}",
-                name=f"WAN {tmpl.name}",
-                icon=tmpl.icon,
-                native_unit_of_measurement=tmpl.native_unit_of_measurement,
-                device_class=tmpl.device_class,
-                state_class=tmpl.state_class,
-                value_fn=_make_netdev_value_fn("vlan2", key_suffix),
-            )
-        ))
+    # For single-WAN use the legacy "WAN Download/Upload" key names.
+    # For multi-WAN create one pair per active WAN, named "WAN1 Download", etc.
+    if multi_wan:
+        for wan_idx in (active_indices if "active_indices" in dir() else [1]):
+            wan_ifname = next(
+                (w.ifname for w in wan_connections if w.index == wan_idx), "vlan2"
+            ) or "vlan2"
+            for tmpl in _BW_SENSOR_TEMPLATES:
+                key_suffix = "rx" if "rx" in tmpl.key else "tx"
+                entities.append(FreshTomatoSensor(coordinator, entry,
+                    FreshTomatoSensorDescription(
+                        key=f"wan{wan_idx}_{tmpl.key}",
+                        name=f"WAN{wan_idx} {tmpl.name}",
+                        icon=tmpl.icon,
+                        native_unit_of_measurement=tmpl.native_unit_of_measurement,
+                        device_class=tmpl.device_class,
+                        state_class=tmpl.state_class,
+                        value_fn=_make_netdev_value_fn(wan_ifname, key_suffix),
+                    )
+                ))
+    else:
+        # Single-WAN (or bridge mode): bandwidth measured on the uplink interface.
+        # In bridge mode vlan2 carries no meaningful traffic — use the WET
+        # bridge's physical interface (e.g. eth1 from lan1_ifnames) instead.
+        _bw_iface = _bridge_bw_iface if _bridge_mode else "vlan2"
+        _bw_label = f"{_bridge_ifname}" if _bridge_mode else "WAN"
+        for tmpl in _BW_SENSOR_TEMPLATES:
+            key_suffix = "rx" if "rx" in tmpl.key else "tx"
+            entities.append(FreshTomatoSensor(coordinator, entry,
+                FreshTomatoSensorDescription(
+                    key=f"wan_{tmpl.key}",
+                    name=f"{_bw_label} {tmpl.name}",
+                    icon=tmpl.icon,
+                    native_unit_of_measurement=tmpl.native_unit_of_measurement,
+                    device_class=tmpl.device_class,
+                    state_class=tmpl.state_class,
+                    value_fn=_make_netdev_value_fn(_bw_iface, key_suffix),
+                )
+            ))
 
     async_add_entities(entities)
 
@@ -455,6 +600,71 @@ class FreshTomatoSensor(CoordinatorEntity[FreshTomatoCoordinator], SensorEntity)
             return fn(self.coordinator.data)
         except Exception:  # pylint: disable=broad-except
             return None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose device lists for the three client-count sensors.
+
+        For wireless, wired, and total sensors only — other sensors return {}.
+        Wired list falls back to arp_table when dhcp_leases is empty (bridge mode).
+        """
+        if self.coordinator.data is None:
+            return {}
+        key = self.entity_description.key
+        if key not in ("wireless_clients", "wired_clients", "total_clients"):
+            return {}
+
+        data = self.coordinator.data
+        wireless_macs = {c["mac"] for c in data.wireless_clients}
+
+        # Build wireless device list
+        wireless_list = [
+            {
+                "mac": c["mac"],
+                "ip": next(
+                    (a["ip"] for a in data.arp_table if a["mac"] == c["mac"]), None
+                ),
+                "name": next(
+                    (
+                        l["name"] for l in data.dhcp_leases
+                        if l["mac"] == c["mac"] and l.get("name") and l["name"] != "*"
+                    ),
+                    next((a["name"] for a in data.arp_table if a["mac"] == c["mac"] and a.get("name")), None),
+                ),
+                "interface": c.get("iface"),
+                "rssi": c.get("rssi"),
+            }
+            for c in data.wireless_clients
+        ]
+
+        # Build wired device list — DHCP leases preferred, ARP table fallback
+        if data.dhcp_leases:
+            wired_list = [
+                {
+                    "mac": l["mac"],
+                    "ip": l.get("ip"),
+                    "name": l["name"] if l.get("name") and l["name"] != "*" else None,
+                }
+                for l in data.dhcp_leases
+                if l["mac"] not in wireless_macs
+            ]
+        else:
+            wired_list = [
+                {
+                    "mac": e["mac"],
+                    "ip": e.get("ip"),
+                    "name": e["name"] if e.get("name") else None,
+                }
+                for e in data.arp_table
+                if e["mac"] not in wireless_macs
+            ]
+
+        if key == "wireless_clients":
+            return {"devices": wireless_list}
+        if key == "wired_clients":
+            return {"devices": wired_list}
+        # total_clients
+        return {"devices": wireless_list + wired_list}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
