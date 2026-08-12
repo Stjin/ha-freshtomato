@@ -35,6 +35,9 @@ A Home Assistant custom integration for routers running [FreshTomato](https://fr
 | **br1 IP Address** | IP of the secondary/uplink bridge, if present |
 | **Firmware Version** | FreshTomato build version (e.g. `FreshTomato 2026.1`) |
 | **Router Model** | Hardware model string from nvram |
+| **CPU Load** | CPU utilization percentage (0–100%) |
+| **RAM Load** | Memory usage percentage (0–100%) |
+| **System Uptime** | Router system uptime (duration & human-readable format, e.g. `37 days, 03h 08m 34s`) |
 | **Total Connected Devices** | Combined unique wireless + wired client count |
 | **Wireless Connected Devices** | Active wireless clients |
 | **Wired Connected Devices** | Clients with active DHCP leases |
@@ -84,7 +87,7 @@ One `device_tracker` entity per discovered client MAC address. Wireless and wire
 ### Via HACS (recommended)
 
 1. In HACS go to **Integrations → ⋮ → Custom repositories**
-2. Add `https://github.com/mx5gr/ha-freshtomato` with category **Integration**
+2. Add `https://github.com/Stjin/ha-freshtomato` with category **Integration**
 3. Click **Download**
 4. Restart Home Assistant
 
